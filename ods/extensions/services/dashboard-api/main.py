@@ -72,6 +72,7 @@ from routers import (
     tailscale,
     usage,
     node,
+    pixel,
 )
 from settings import (
     _ENV_ASSIGNMENT_RE, _ENV_COMMENTED_ASSIGNMENT_RE, _SETTINGS_APPLY_ALLOWED_SERVICES, _parse_env_text, _read_env_map_from_path,
@@ -1114,6 +1115,7 @@ app.include_router(talk.router)
 app.include_router(tailscale.router)
 app.include_router(usage.router)
 app.include_router(node.router)
+app.include_router(pixel.router)
 
 
 # ================================================================
@@ -1422,11 +1424,12 @@ async def _build_api_status() -> dict:
 
     model_data = None
     if model_info:
+        runtime_model_name = loaded_model or model_info.name
         model_data = {
-            "name": model_info.name,
-            "currentModel": model_info.name,
+            "name": runtime_model_name,
+            "currentModel": runtime_model_name,
             "configuredModel": model_info.name,
-            "loadedModel": loaded_model or model_info.name,
+            "loadedModel": runtime_model_name,
             "tokensPerSecond": llama_metrics_data.get("tokens_per_second") or None,
             "contextLength": context_size or model_info.context_length,
         }
@@ -1450,7 +1453,7 @@ async def _build_api_status() -> dict:
         "gpu": gpu_data, "services": services_data, "model": model_data,
         "bootstrap": bootstrap_data, "uptime": uptime,
         "version": app.version, "tier": tier,
-        "currentModel": configured_model_name,
+        "currentModel": loaded_model_name,
         "loadedModel": loaded_model_name,
         "configuredModel": configured_model_name,
         "cpu": cpu_metrics, "ram": ram_metrics,

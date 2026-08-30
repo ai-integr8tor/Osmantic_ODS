@@ -88,6 +88,9 @@ source "$SCRIPT_DIR/installers/lib/python-runtime.sh"
 source "$SCRIPT_DIR/installers/lib/progress.sh"
 source "$SCRIPT_DIR/installers/lib/model-lifecycle-lock.sh"
 source "$SCRIPT_DIR/installers/lib/external-services.sh"
+source "$SCRIPT_DIR/installers/lib/pixel-integration.sh"
+source "$SCRIPT_DIR/installers/lib/pixel-host-install.sh"
+source "$SCRIPT_DIR/lib/pixel-uninstall.sh"
 if [[ -f "$SCRIPT_DIR/lib/service-registry.sh" ]]; then 
     source "$SCRIPT_DIR/lib/service-registry.sh" 
 fi
@@ -103,12 +106,12 @@ ENABLE_VOICE=true
 ENABLE_WORKFLOWS=true
 ENABLE_RAG=true
 ENABLE_RECOMMENDED=true
-# Default agent flipped to Hermes Agent (Nous Research) on 2026-05-12.
-# OpenClaw is deprecated and will be removed in the next release; new
-# installs no longer enable it by default. Users who explicitly pass
-# --openclaw or upgrade an existing install with OpenClaw enabled keep
-# it working until the removal release. See docs/MIGRATION-OPENCLAW-TO-HERMES.md.
+# Pixel is preferred automatically only on its qualified Linux hosts after a
+# separate written license agreement is acknowledged. Hermes stays enabled as
+# the portable fallback. OpenClaw is deprecated and remains explicit opt-in.
 ENABLE_HERMES=true
+ENABLE_PIXEL="${ENABLE_PIXEL:-auto}"
+PIXEL_EXPLICIT=false
 ENABLE_OPENCLAW=false
 OPENCLAW_EXPLICIT=false
 ENABLE_COMFYUI=true
@@ -176,8 +179,10 @@ Options:
     --no-rag          Disable RAG / Qdrant
     --recommended     Enable LiteLLM + SearXNG + Token Spy support services
     --no-recommended  Disable recommended support services
-    --hermes          Enable Hermes Agent (default; new default agent as of 2026-05-12)
+    --hermes          Enable Hermes Agent (portable fallback and rollback path)
     --no-hermes       Disable Hermes Agent
+    --pixel           Require Pixel as the default agent (qualified Linux host and separate license required)
+    --no-pixel        Disable Pixel and use the configured fallback agent
     --openclaw        Enable OpenClaw (DEPRECATED — see docs/MIGRATION-OPENCLAW-TO-HERMES.md)
     --no-openclaw     Disable OpenClaw
     --comfyui         Enable ComfyUI image generation
@@ -242,6 +247,8 @@ while [[ $# -gt 0 ]]; do
         --no-recommended) ENABLE_RECOMMENDED=false; shift ;;
         --hermes) ENABLE_HERMES=true; shift ;;
         --no-hermes) ENABLE_HERMES=false; shift ;;
+        --pixel) ENABLE_PIXEL=true; PIXEL_EXPLICIT=true; shift ;;
+        --no-pixel) ENABLE_PIXEL=false; PIXEL_EXPLICIT=true; shift ;;
         --openclaw) ENABLE_OPENCLAW=true; OPENCLAW_EXPLICIT=true; shift ;;
         --no-openclaw) ENABLE_OPENCLAW=false; OPENCLAW_EXPLICIT=true; shift ;;
         --comfyui) ENABLE_COMFYUI=true; shift ;;
@@ -252,7 +259,7 @@ while [[ $# -gt 0 ]]; do
         # NOTE: with --all, --no-langfuse must appear AFTER --all on the command
         # line (flag processing is case-loop ordered, matching comfyui).
         --no-langfuse) ENABLE_LANGFUSE=false; shift ;;
-        # --all enables Hermes (the new default agent) but NOT OpenClaw —
+        # --all enables the Hermes fallback but NOT deprecated OpenClaw —
         # the deprecated agent is opt-in via --openclaw for the deprecation
         # release. Will be dropped entirely in the removal release.
         # ENABLE_ODS_PROXY is included so magic-link invite URLs

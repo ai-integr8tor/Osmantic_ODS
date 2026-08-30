@@ -20,6 +20,7 @@
 #           OPENCODE_SERVER_PASSWORD,
 #           OPENCLAW_TOKEN, OPENCLAW_PROVIDER_NAME, OPENCLAW_PROVIDER_URL,
 #           OPENCLAW_MODEL, OPENCLAW_CONTEXT, GPU_ASSIGNMENT_JSON_B64 (in .env)
+#           PIXEL_SOURCE_URL, PIXEL_SOURCE_REF, PIXEL_SOURCE_DIR when Pixel is enabled
 #
 # Modder notes:
 #   This is the largest phase. Modify .env generation, add new config files,
@@ -44,11 +45,74 @@ if $DRY_RUN; then
     [[ "$ENABLE_OPENCLAW" == "true" ]] && log "[DRY RUN] Would configure OpenClaw (model: $LLM_MODEL, config: ${OPENCLAW_CONFIG:-default})"
     log "[DRY RUN] Would validate .env against schema"
 else
+    # install-core.sh normally imports these helpers before the phase runs.
+    # Source them defensively so isolated phase reuse has the same contract.
+    if ! declare -F ods_pixel_reconcile_installed_compose >/dev/null 2>&1; then
+        # shellcheck source=../lib/pixel-integration.sh
+        _phase06_source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        source "$_phase06_source_dir/../lib/pixel-integration.sh"
+        unset _phase06_source_dir
+    fi
+
     # shellcheck source=../lib/llama-memory-budget.sh
     source "$SCRIPT_DIR/installers/lib/llama-memory-budget.sh"
 
     # shellcheck source=../../lib/dotenv-quote.sh
     source "$SCRIPT_DIR/lib/dotenv-quote.sh"
+
+    # A Pixel-to-Hermes rerun must retire the exact ODS-managed host runtime,
+    # not merely remove the Compose edge from the next launch. Do this before
+    # copying new source over an existing install so the fail-closed cleanup can
+    # still compare root-owned artifacts with the source that installed them.
+    _phase06_pixel_marker="$HOME/.config/ods/pixel-managed.json"
+    _phase06_pixel_source_transition=0
+    if [[ "${ENABLE_PIXEL_RUNTIME:-false}" == "true" \
+        && -n "${PIXEL_SOURCE_REF:-}" \
+        && ( -e "$_phase06_pixel_marker" || -L "$_phase06_pixel_marker" ) ]]; then
+        _phase06_pixel_owner="$(ods_pixel_install_owner)" || {
+            error "Could not identify the ODS owner for a Pixel source transition."
+            return 1
+        }
+        _phase06_pixel_home="$(ods_pixel_owner_home "$_phase06_pixel_owner")" || {
+            error "Could not resolve the ODS owner home for a Pixel source transition."
+            return 1
+        }
+        _ods_pixel_source_transition_required \
+            "$_phase06_pixel_owner" "$_phase06_pixel_home" "$PIXEL_SOURCE_REF" \
+            || _phase06_pixel_source_transition=$?
+        case "$_phase06_pixel_source_transition" in
+            0)
+                if ! declare -F ods_pixel_uninstall_managed >/dev/null 2>&1; then
+                    # shellcheck source=../../lib/pixel-uninstall.sh
+                    source "$SCRIPT_DIR/lib/pixel-uninstall.sh"
+                fi
+                _phase06_step "rebind-pixel-source"
+                ai "Retiring the verified prior Pixel source before applying the new immutable source..."
+                if ! ods_pixel_uninstall_managed "$INSTALL_DIR" "$_phase06_pixel_home"; then
+                    error "Could not safely retire the prior ODS-managed Pixel source."
+                    return 1
+                fi
+                ;;
+            1) ;;
+            *)
+                error "The existing ODS-managed Pixel state is unsafe for a source transition."
+                return 1
+                ;;
+        esac
+        unset _phase06_pixel_owner _phase06_pixel_home
+    elif [[ "${ENABLE_PIXEL_RUNTIME:-false}" != "true" \
+        && ( -e "$_phase06_pixel_marker" || -L "$_phase06_pixel_marker" ) ]]; then
+        if ! declare -F ods_pixel_uninstall_managed >/dev/null 2>&1; then
+            # shellcheck source=../../lib/pixel-uninstall.sh
+            source "$SCRIPT_DIR/lib/pixel-uninstall.sh"
+        fi
+        _phase06_step "deactivate-pixel"
+        if ! ods_pixel_uninstall_managed "$INSTALL_DIR" "$HOME"; then
+            error "Could not safely deactivate the ODS-managed Pixel host runtime."
+            return 1
+        fi
+    fi
+    unset _phase06_pixel_marker _phase06_pixel_source_transition
 
     _phase06_rootless=false
     if [[ -f "$SCRIPT_DIR/lib/rootless-ownership.sh" ]]; then
@@ -193,6 +257,11 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
         ai_ok "Source files installed"
     else
         log "Running in-place (source == install dir), skipping file copy"
+    fi
+
+    _phase06_step "reconcile-pixel-compose"
+    if ! ods_pixel_reconcile_installed_compose "$SCRIPT_DIR" "$INSTALL_DIR" "${ENABLE_PIXEL_RUNTIME:-false}"; then
+        error "Could not reconcile the installed Pixel Compose fragment with the selected default agent"
     fi
 
     # ODSForge was retired from the shipped stack after Hermes became the
@@ -520,6 +589,35 @@ raise SystemExit(1)' 2>/dev/null && return 0
     OPENCODE_SERVER_PASSWORD=$(_env_get OPENCODE_SERVER_PASSWORD "$(openssl rand -base64 16 2>/dev/null || head -c 16 /dev/urandom | base64)")
     SEARXNG_SECRET=$(_env_get SEARXNG_SECRET "$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | xxd -p | tr -d '\n')")
 
+    PIXEL_OPENWEBUI_KEY_VALUE=""
+    PIXEL_INGRESS_GID_VALUE=""
+    PIXEL_SOURCE_URL_VALUE=""
+    PIXEL_SOURCE_REF_VALUE=""
+    PIXEL_SOURCE_DIR_VALUE=""
+    if [[ "${ENABLE_PIXEL_RUNTIME:-false}" == "true" ]]; then
+        PIXEL_OPENWEBUI_KEY_VALUE="$(_env_get PIXEL_OPENWEBUI_KEY "")"
+        if [[ -z "$PIXEL_OPENWEBUI_KEY_VALUE" ]]; then
+            PIXEL_OPENWEBUI_KEY_VALUE="$(ods_pixel_generate_key)" || error "Could not generate Pixel edge key"
+        fi
+        [[ "$PIXEL_OPENWEBUI_KEY_VALUE" =~ ^[0-9a-f]{64}$ ]] || error "Existing PIXEL_OPENWEBUI_KEY is invalid"
+
+        # Phase 11 creates/resolves ods-pixel immediately before Compose
+        # validation, then atomically fills this initially empty numeric GID.
+        PIXEL_INGRESS_GID_VALUE="$(_env_get_preserve_empty PIXEL_INGRESS_GID "")"
+        [[ -z "$PIXEL_INGRESS_GID_VALUE" || "$PIXEL_INGRESS_GID_VALUE" =~ ^[1-9][0-9]*$ ]] || \
+            error "Existing PIXEL_INGRESS_GID is invalid"
+
+        PIXEL_SOURCE_URL_VALUE="$(_env_get_explicit_first PIXEL_SOURCE_URL "https://github.com/Osmantic/Pixel.git")"
+        PIXEL_SOURCE_REF_VALUE="$(_env_get_explicit_first PIXEL_SOURCE_REF "f1f811d02bffd5a1589eb6feb34323f6dadf7832")"
+        PIXEL_SOURCE_DIR_VALUE="$(_env_get_explicit_first PIXEL_SOURCE_DIR "")"
+        # Phase 11 installs Pixel in this same installer shell. Preserve the
+        # resolved immutable source contract in that shell as well as in .env;
+        # transient environment prefixes used for validation do not persist.
+        ods_pixel_activate_source_contract \
+            "$PIXEL_SOURCE_URL_VALUE" "$PIXEL_SOURCE_REF_VALUE" "$PIXEL_SOURCE_DIR_VALUE" || \
+            error "Pixel source URL/ref failed the immutable-source policy"
+    fi
+
     # Langfuse (LLM Observability). LANGFUSE_ENABLED mirrors the install-time
     # ENABLE_LANGFUSE toggle, falling back to whatever the user had in .env on
     # re-install so manual post-install `ods enable langfuse` edits survive.
@@ -591,6 +689,18 @@ raise SystemExit(1)' 2>/dev/null && return 0
         OPEN_WEBUI_LLM_BASE_URL_VALUE=$(_env_get OPEN_WEBUI_LLM_BASE_URL "")
         OPEN_WEBUI_LLM_API_KEY_VALUE=$(_env_get OPEN_WEBUI_LLM_API_KEY "")
     fi
+    _default_open_webui_task_model=""
+    if [[ "$ODS_MODEL_SWITCHBOARD_VALUE" == "enabled" ]]; then
+        _default_open_webui_task_model="ods/current"
+    elif [[ "$EXTERNAL_LLM_ACTIVE" == "true" ]]; then
+        _default_open_webui_task_model="$EXTERNAL_SELECTED_MODEL"
+    elif [[ "$OPEN_WEBUI_LLM_BASE_URL_VALUE" == *"litellm:4000"* || "$LLM_API_URL_VALUE" == *"litellm:4000"* ]]; then
+        _default_open_webui_task_model="default"
+    fi
+    # Direct llama.cpp deliberately leaves this empty: the Pixel Compose
+    # overlay then follows GGUF_FILE, which is the exact /v1/models ID and
+    # changes with bootstrap promotion. LLM_MODEL is only a logical catalog ID.
+    OPEN_WEBUI_TASK_MODEL_VALUE=$(_env_get OPEN_WEBUI_TASK_MODEL "$_default_open_webui_task_model")
     if [[ "${ODS_MODE:-local}" == "cloud" ]]; then
         _default_hermes_base_url="http://litellm:4000/v1"
         _default_hermes_api_key="${LITELLM_KEY}"
@@ -742,15 +852,33 @@ raise SystemExit(1)' 2>/dev/null && return 0
     fi
     ODS_DEVICE_NAME=$(_env_get ODS_DEVICE_NAME "$_device_default")
 
-    # Whisper STT model — NVIDIA picks the larger turbo model, everyone else
-    # uses base. Phase 12 reads this to pre-download the right file, and
-    # Open WebUI reads it to request the same model for transcription.
-    if [[ "$GPU_BACKEND" == "nvidia" ]]; then
+    # Whisper acceleration is separately capability-gated from the primary LLM
+    # backend because the pinned Speaches CUDA image has a stricter driver
+    # floor. Phase 02 forces CPU only for Whisper when needed.
+    if [[ "${WHISPER_ACCELERATION_FORCED_CPU:-false}" == "true" ]]; then
+        WHISPER_ACCELERATION_VALUE="cpu"
+    else
+        WHISPER_ACCELERATION_VALUE=$(_env_get WHISPER_ACCELERATION "${WHISPER_ACCELERATION:-$([[ "$GPU_BACKEND" == "nvidia" ]] && echo cuda || echo cpu)}")
+    fi
+    case "$WHISPER_ACCELERATION_VALUE" in
+        cpu|cuda) ;;
+        *) WHISPER_ACCELERATION_VALUE="$([[ "$GPU_BACKEND" == "nvidia" ]] && echo cuda || echo cpu)" ;;
+    esac
+    if [[ "$WHISPER_ACCELERATION_VALUE" == "cuda" ]]; then
         _default_stt_model="deepdml/faster-whisper-large-v3-turbo-ct2"
+        _default_whisper_image=""
     else
         _default_stt_model="Systran/faster-whisper-base"
+        _default_whisper_image="ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cpu"
     fi
     AUDIO_STT_MODEL=$(_env_get AUDIO_STT_MODEL "${AUDIO_STT_MODEL:-$_default_stt_model}")
+    WHISPER_IMAGE_VALUE=$(_env_get WHISPER_IMAGE "${WHISPER_IMAGE:-$_default_whisper_image}")
+    if [[ "$WHISPER_ACCELERATION_VALUE" == "cpu" ]]; then
+        [[ "$AUDIO_STT_MODEL" =~ ([Ll]arge-v3|[Tt]urbo) ]] && AUDIO_STT_MODEL="$_default_stt_model"
+        if [[ -z "$WHISPER_IMAGE_VALUE" || "$WHISPER_IMAGE_VALUE" =~ [Cc][Uu][Dd][Aa] ]]; then
+            WHISPER_IMAGE_VALUE="$_default_whisper_image"
+        fi
+    fi
     EMBEDDING_MODEL_VALUE=$(_env_get EMBEDDING_MODEL "${EMBEDDING_MODEL:-BAAI/bge-base-en-v1.5}")
     RAG_EMBEDDING_MODEL_VALUE=$(_env_get_preserve_empty RAG_EMBEDDING_MODEL "${RAG_EMBEDDING_MODEL:-}")
     RAG_OPENAI_API_BASE_URL_VALUE=$(_env_get_preserve_empty RAG_OPENAI_API_BASE_URL "${RAG_OPENAI_API_BASE_URL:-}")
@@ -824,6 +952,7 @@ ODS_MODEL_SWITCHBOARD=${ODS_MODEL_SWITCHBOARD_VALUE}
 LLM_API_URL=${LLM_API_URL_VALUE}
 OPEN_WEBUI_LLM_BASE_URL=${OPEN_WEBUI_LLM_BASE_URL_VALUE}
 OPEN_WEBUI_LLM_API_KEY=${OPEN_WEBUI_LLM_API_KEY_VALUE}
+OPEN_WEBUI_TASK_MODEL=${OPEN_WEBUI_TASK_MODEL_VALUE}
 LLM_BACKEND=$(if [[ "$EXTERNAL_LLM_ACTIVE" == "true" ]]; then echo "external"; elif [[ "$ODS_MODE_VALUE" == "lemonade" ]]; then echo "lemonade"; else echo "llama-server"; fi)
 LLM_API_BASE_PATH=$(if [[ "$ODS_MODE_VALUE" == "lemonade" ]]; then echo "${LEMONADE_API_BASE_PATH_VALUE}"; else echo "/v1"; fi)
 EXTERNAL_LLM_URL=${EXTERNAL_LLM_URL_VALUE}
@@ -999,6 +1128,19 @@ DASHBOARD_API_KEY=${DASHBOARD_API_KEY}
 ODS_AGENT_KEY=${ODS_AGENT_KEY}
 ODS_SESSION_SECRET=${ODS_SESSION_SECRET}
 HERMES_DASHBOARD_SESSION_TOKEN=${HERMES_DASHBOARD_SESSION_TOKEN}
+$(if [[ "${ENABLE_PIXEL_RUNTIME:-false}" == "true" ]]; then cat << PIXEL_ENV
+
+#=== Pixel default agent (separate written license required) ===
+PIXEL_AGENT_MODE=pixel
+PIXEL_LICENSE_ACCEPTED=true
+PIXEL_SOURCE_URL=$(dotenv_quote "$PIXEL_SOURCE_URL_VALUE")
+PIXEL_SOURCE_REF=${PIXEL_SOURCE_REF_VALUE}
+PIXEL_SOURCE_DIR=$(dotenv_quote "$PIXEL_SOURCE_DIR_VALUE")
+PIXEL_OPENWEBUI_KEY=${PIXEL_OPENWEBUI_KEY_VALUE}
+PIXEL_INGRESS_RUNTIME_DIR=/run/ods-pixel
+PIXEL_INGRESS_GID=${PIXEL_INGRESS_GID_VALUE}
+PIXEL_ENV
+fi)
 SHIELD_API_KEY=${SHIELD_API_KEY}
 N8N_USER=admin@ods.local
 N8N_PASS=${N8N_PASS}
@@ -1014,8 +1156,10 @@ DIFY_SECRET_KEY=${DIFY_SECRET_KEY}
 
 #=== Voice Settings ===
 WHISPER_MODEL=base
+# Whisper acceleration is independently capability-gated from the LLM GPU.
+WHISPER_ACCELERATION=${WHISPER_ACCELERATION_VALUE}
+WHISPER_IMAGE=${WHISPER_IMAGE_VALUE}
 # Whisper STT model passed to Open WebUI and pre-downloaded by Phase 12.
-# Auto-selected based on GPU backend; edit to override.
 AUDIO_STT_MODEL=${AUDIO_STT_MODEL}
 TTS_VOICE=en_US-lessac-medium
 
@@ -1244,6 +1388,8 @@ search:
     - html
     - json
 engines:
+  - name: bing
+    disabled: false
   - name: duckduckgo
     disabled: false
   - name: google

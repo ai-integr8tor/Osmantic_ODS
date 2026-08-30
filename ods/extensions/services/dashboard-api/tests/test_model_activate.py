@@ -779,6 +779,78 @@ class TestLemonadeCompletionReady:
         assert proof["contextVerified"] is True
         assert proof["verifiedAt"].endswith("+00:00")
 
+    def test_readiness_accepts_llama_context_alignment_padding(self, monkeypatch):
+        def fake_run(cmd, **_kwargs):
+            url = next((str(part) for part in cmd if str(part).startswith("http")), "")
+            if url.endswith("/v1/models"):
+                body = _llama_identity_response("runtime/new-model.gguf")
+            elif url.endswith("/props"):
+                body = json.dumps({
+                    "default_generation_settings": {"n_ctx": 20224}
+                })
+            else:
+                body = ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=body, stderr="")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(_mod, "_chat_completion_ready", lambda *_a, **_k: True)
+        proof = _mod._wait_for_model_readiness(
+            {
+                "GPU_BACKEND": "nvidia",
+                "OLLAMA_PORT": "8080",
+                "CTX_SIZE": "20000",
+            },
+            model_id="new-model",
+            gguf_file="new-model.gguf",
+            llm_model_name="new-model",
+            attempts=1,
+            initial_delay=0,
+            interval=0,
+            return_proof=True,
+            require_exact_context=True,
+        )
+        assert proof["contextLength"] == 20224
+        assert proof["contextVerified"] is True
+
+    def test_readiness_rejects_material_llama_context_drift(self, monkeypatch):
+        completion_calls = []
+
+        def fake_run(cmd, **_kwargs):
+            url = next((str(part) for part in cmd if str(part).startswith("http")), "")
+            if url.endswith("/v1/models"):
+                body = _llama_identity_response("runtime/new-model.gguf")
+            elif url.endswith("/props"):
+                body = json.dumps({
+                    "default_generation_settings": {"n_ctx": 20256}
+                })
+            else:
+                body = ""
+            return subprocess.CompletedProcess(cmd, 0, stdout=body, stderr="")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            _mod,
+            "_chat_completion_ready",
+            lambda *_a, **_k: completion_calls.append(True) or True,
+        )
+        proof = _mod._wait_for_model_readiness(
+            {
+                "GPU_BACKEND": "nvidia",
+                "OLLAMA_PORT": "8080",
+                "CTX_SIZE": "20000",
+            },
+            model_id="new-model",
+            gguf_file="new-model.gguf",
+            llm_model_name="new-model",
+            attempts=1,
+            initial_delay=0,
+            interval=0,
+            return_proof=True,
+            require_exact_context=True,
+        )
+        assert proof == {}
+        assert completion_calls == []
+
     def test_readiness_rejects_runtime_context_below_requested(self, monkeypatch):
         completion_calls = []
 
@@ -1413,7 +1485,8 @@ class TestPatchHermesModelConfig:
 
 class TestComposeRestartLlamaServer:
 
-    def test_amd_uses_stop_then_up(self, monkeypatch, tmp_path):
+    @pytest.mark.parametrize("backend", ["amd", "nvidia"])
+    def test_force_recreates_without_strict_stop(self, backend, monkeypatch, tmp_path):
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -1428,16 +1501,13 @@ class TestComposeRestartLlamaServer:
         )
         monkeypatch.setattr(subprocess, "run", fake_run)
 
-        _compose_restart_llama_server({"GPU_BACKEND": "amd"})
+        _compose_restart_llama_server({"GPU_BACKEND": backend})
 
         assert calls == [
             [
                 "docker", "compose", "--env-file", ".env", "-f",
-                "docker-compose.base.yml", "stop", "llama-server",
-            ],
-            [
-                "docker", "compose", "--env-file", ".env", "-f",
-                "docker-compose.base.yml", "up", "-d", "llama-server",
+                "docker-compose.base.yml", "up", "-d", "--force-recreate",
+                "--no-deps", "llama-server",
             ],
         ]
 
@@ -3364,6 +3434,115 @@ def test_model_gpu_plan_explicitly_skips_wsl_auto_replan(tmp_path, monkeypatch):
     ) is None
 
 
+def test_managed_pixel_reconcile_is_noop_when_this_install_does_not_own_pixel(
+    monkeypatch,
+):
+    monkeypatch.setattr(_mod, "_ods_managed_pixel_identity", lambda: None)
+    monkeypatch.setattr(
+        _mod.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("an unmanaged Pixel must not be touched"),
+    )
+
+    assert _mod._reconcile_ods_managed_pixel_model("safe-model", 65536) == "not_installed"
+
+
+def test_managed_pixel_reconcile_uses_positional_args_and_minimal_environment(
+    tmp_path,
+    monkeypatch,
+):
+    install_dir = tmp_path / "install"
+    home = tmp_path / "owner-home"
+    install_dir.mkdir()
+    home.mkdir()
+    (install_dir / ".env").write_text(
+        "PIXEL_SOURCE_URL=https://github.com/Osmantic/Pixel.git\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout="reconciled\n", stderr="")
+
+    monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+    monkeypatch.setattr(
+        _mod,
+        "_ods_managed_pixel_identity",
+        lambda: ("pixel-owner", home),
+    )
+    monkeypatch.setenv("UNRELATED_SECRET", "must-not-cross-boundary")
+    monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+    assert _mod._reconcile_ods_managed_pixel_model(
+        "qwen3.5-9b",
+        131072,
+        max_tokens=4096,
+        reasoning=True,
+    ) == "reconciled"
+    assert captured["argv"][-7:] == [
+        str(install_dir),
+        "pixel-owner",
+        str(home),
+        "qwen3.5-9b",
+        "131072",
+        "4096",
+        "true",
+    ]
+    assert captured["kwargs"]["timeout"] == 900
+    assert captured["kwargs"]["check"] is False
+    assert captured["kwargs"]["env"]["PIXEL_SOURCE_URL"] == (
+        "https://github.com/Osmantic/Pixel.git"
+    )
+    assert "UNRELATED_SECRET" not in captured["kwargs"]["env"]
+
+
+def test_managed_pixel_reconcile_rejects_context_below_pixel_contract(monkeypatch):
+    monkeypatch.setattr(
+        _mod,
+        "_ods_managed_pixel_identity",
+        lambda: ("pixel-owner", Path("/safe/pixel-owner")),
+    )
+
+    with pytest.raises(RuntimeError, match="at least|between 4096"):
+        _mod._reconcile_ods_managed_pixel_model("safe-model", 2048)
+
+
+@pytest.mark.parametrize(
+    ("context_length", "expected"),
+    [(4096, 2048), (8192, 4096), (16384, 2048), (24576, 3072), (32768, 4096)],
+)
+def test_managed_pixel_output_budget_preserves_agent_prompt_room(
+    context_length,
+    expected,
+):
+    assert _mod._pixel_max_tokens_for_context(context_length) == expected
+
+
+@pytest.mark.parametrize(
+    ("model", "mode", "expected"),
+    [
+        ("qwen3.5-9b", "off", False),
+        ("jamba-reasoning-3b", "none", False),
+        ("deepseek-r1-7b", "false", False),
+        ("NVIDIA-Nemotron3-Nano-4B", "off", False),
+        ("phi-4-mini", "off", False),
+        ("phi-4-mini", "deepseek", True),
+        ("qwen3.5-9b", "", False),
+    ],
+)
+def test_pixel_reasoning_capability_follows_model_family_and_runtime_mode(
+    model,
+    mode,
+    expected,
+):
+    assert _mod._pixel_model_reasoning_capable(
+        model,
+        {"LLAMA_REASONING": mode},
+    ) is expected
+
+
 class TestModelActivateRollback:
 
     @pytest.fixture(autouse=True)
@@ -3400,6 +3579,238 @@ class TestModelActivateRollback:
         assert "requires the persisted environment" in handler.parse_response()["error"]
         assert not env_path.exists()
         assert models_ini.read_text(encoding="utf-8") == ini_text
+
+    def test_activation_reconciles_pixel_model_context_and_receipt(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        install_dir, _env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        reconciliations = []
+
+        def reconcile(model, context, **options):
+            reconciliations.append((model, context, options))
+            return "reconciled"
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", _mock_verified_readiness)
+        monkeypatch.setattr(_mod, "_reconcile_ods_managed_pixel_model", reconcile)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(
+            handler,
+            "target-model",
+            requested_context_length=65536,
+        )
+
+        assert handler.response_code == 200
+        assert reconciliations == [(
+            "new-model",
+            65536,
+            {"max_tokens": 4096, "reasoning": False},
+        )]
+        response = handler.parse_response()
+        assert response["consumers"]["pixel"] == "reconciled"
+        receipt = json.loads(
+            (install_dir / "data" / "model-activation-receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert receipt["consumers"]["pixel"] == "reconciled"
+
+    def test_managed_pixel_requires_valid_previous_context_before_mutation(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        install_dir, env_path, env_text, models_ini, ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(
+            _mod,
+            "_ods_managed_pixel_identity",
+            lambda: ("pixel-owner", tmp_path / "pixel-owner"),
+        )
+        monkeypatch.setattr(
+            _mod,
+            "_compose_restart_llama_server",
+            lambda _env: pytest.fail("invalid prior Pixel context must fail before restart"),
+        )
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 500
+        assert "at least 4096" in handler.parse_response()["error"]
+        assert env_path.read_text(encoding="utf-8") == env_text
+        assert models_ini.read_text(encoding="utf-8") == ini_text
+
+    def test_pixel_reconcile_failure_rolls_back_and_rebinds_previous_pixel_model(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        env_path.write_text(
+            env_path.read_text(encoding="utf-8").replace("CTX_SIZE=2048", "CTX_SIZE=4096"),
+            encoding="utf-8",
+        )
+        runtime_restarts = []
+        reconciliations = []
+
+        def restart_runtime(env):
+            runtime_restarts.append(env["LLM_MODEL"])
+
+        def reconcile(model, context, **options):
+            reconciliations.append((model, context, options))
+            if model == "new-model":
+                raise RuntimeError("simulated Pixel reconciliation failure")
+            return "reconciled"
+
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_compose_restart_llama_server", restart_runtime)
+        monkeypatch.setattr(_mod, "_wait_for_model_readiness", _mock_verified_readiness)
+        monkeypatch.setattr(_mod, "_reconcile_ods_managed_pixel_model", reconcile)
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(handler, "target-model")
+
+        assert handler.response_code == 500
+        response = handler.parse_response()
+        assert response["rolled_back"] is True
+        assert "simulated Pixel reconciliation failure" in response["error"]
+        assert runtime_restarts == ["new-model", "old-model"]
+        assert reconciliations == [
+            ("new-model", 4096, {"max_tokens": 2048, "reasoning": False}),
+            ("old-model", 4096, {"max_tokens": 2048, "reasoning": False}),
+        ]
+        assert _mod.load_env(env_path)["LLM_MODEL"] == "old-model"
+
+    def test_uses_lower_live_ram_limit_instead_of_host_physical_ram(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(_mod, "_nvidia_vram_gb", lambda: 8.0)
+        monkeypatch.setattr(_mod, "_system_ram_gb", lambda: 15)
+        monkeypatch.setattr(_mod.platform, "machine", lambda: "x86_64")
+        model = {
+            "runtime_profiles": [
+                {
+                    "id": "host-physical-ram-profile",
+                    "backend": "nvidia",
+                    "host_arch": ["amd64"],
+                    "memory_type": "discrete",
+                    "vram_min_gb": 7.5,
+                    "vram_max_gb": 8.5,
+                    "system_ram_min_gb": 31,
+                },
+                {
+                    "id": "wsl-constrained-profile",
+                    "backend": "nvidia",
+                    "host_arch": ["amd64"],
+                    "memory_type": "discrete",
+                    "vram_min_gb": 7.5,
+                    "vram_max_gb": 8.5,
+                    "system_ram_min_gb": 15,
+                },
+            ]
+        }
+
+        profile = _mod._select_runtime_profile(
+            model,
+            {
+                "GPU_BACKEND": "nvidia",
+                "GPU_MEMORY_TYPE": "discrete",
+                "SYSTEM_RAM_GB": "31",
+            },
+        )
+
+        assert profile["id"] == "wsl-constrained-profile"
+
+    def test_nvidia_profile_selection_fails_closed_without_vram_probe(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(_mod, "_nvidia_vram_gb", lambda: 0.0)
+        monkeypatch.setattr(_mod, "_system_ram_gb", lambda: 15)
+
+        with pytest.raises(RuntimeError, match="VRAM could not be determined"):
+            _mod._select_runtime_profile(
+                {
+                    "runtime_profiles": [
+                        {
+                            "id": "nvidia-profile",
+                            "backend": "nvidia",
+                            "vram_min_gb": 7.5,
+                            "context_length": 32768,
+                        }
+                    ]
+                },
+                {"GPU_BACKEND": "nvidia"},
+            )
+
+    def test_nvidia_vram_probe_uses_wsl_bridge_outside_service_path(
+        self,
+        monkeypatch,
+    ):
+        calls = []
+        real_is_file = Path.is_file
+
+        def fake_is_file(path):
+            if path.as_posix() == "/usr/lib/wsl/lib/nvidia-smi":
+                return True
+            return real_is_file(path)
+
+        def fake_run(cmd, **_kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="8151\n", stderr="")
+
+        monkeypatch.setattr(_mod.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(Path, "is_file", fake_is_file)
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        assert _mod._nvidia_vram_gb() == pytest.approx(8151 / 1024)
+        assert calls == [[
+            str(Path("/usr/lib/wsl/lib/nvidia-smi")),
+            "--query-gpu=memory.total",
+            "--format=csv,noheader,nounits",
+        ]]
+
+    def test_env_assignment_round_trips_spaces_and_shell_metacharacters(
+        self,
+        tmp_path,
+    ):
+        env_path = tmp_path / ".env"
+        value = "NVIDIA 8GB owner's $HOME `command` profile"
+
+        env_path.write_text(
+            _mod._upsert_env_text("MODEL_RUNTIME_PROFILE_LABEL=old\n", "MODEL_RUNTIME_PROFILE_LABEL", value),
+            encoding="utf-8",
+        )
+
+        persisted = env_path.read_text(encoding="utf-8")
+        assert persisted == f"MODEL_RUNTIME_PROFILE_LABEL={_mod.shlex.quote(value)}\n"
+        assert _mod.load_env(env_path)["MODEL_RUNTIME_PROFILE_LABEL"] == value
+
+    def test_bound_env_update_and_restore_preserve_existing_inode(self, tmp_path):
+        env_path = tmp_path / ".env"
+        env_path.write_text("LLM_MODEL=old\n", encoding="utf-8")
+        original_inode = env_path.stat().st_ino
+        snapshot = _mod._snapshot_text_file(env_path)
+
+        _mod._write_bound_env_text(env_path, "LLM_MODEL=new\n")
+        assert env_path.stat().st_ino == original_inode
+        assert _mod.load_env(env_path)["LLM_MODEL"] == "new"
+
+        _mod._restore_bound_env_file(env_path, snapshot)
+        assert env_path.stat().st_ino == original_inode
+        assert env_path.read_text(encoding="utf-8") == "LLM_MODEL=old\n"
 
     def test_malformed_model_library_cannot_fall_back_to_unverified_local_model(
         self,
@@ -3912,6 +4323,8 @@ class TestModelActivateRollback:
             record_restart(_mod.load_env(path))
 
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"litellm"})
+        monkeypatch.setattr(_mod, "resolve_compose_flags", list)
         monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(
             _mod,
@@ -3944,7 +4357,10 @@ class TestModelActivateRollback:
                     else _llama_identity_response("new-model.gguf")
                 )
                 return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
-            if cmd == ["docker", "restart", "ods-litellm"]:
+            if cmd == [
+                "docker", "compose", "up", "-d", "--no-deps",
+                "--force-recreate", "litellm",
+            ]:
                 raise subprocess.TimeoutExpired(cmd, 60)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -4165,7 +4581,7 @@ class TestModelActivateRollback:
         assert receipt["tier"] is None
         assert receipt["context_length"] == 32768
         env_text = env_path.read_text(encoding="utf-8")
-        assert "GGUF_FILE=My Custom Model.Q8_0.GGUF" in env_text
+        assert "GGUF_FILE='My Custom Model.Q8_0.GGUF'" in env_text
         assert "LLM_MODEL=My-Custom-Model.Q8_0" in env_text
         assert "[My-Custom-Model.Q8_0]" in models_ini.read_text(encoding="utf-8")
         assert "filename = My Custom Model.Q8_0.GGUF" in models_ini.read_text(encoding="utf-8")
@@ -4475,7 +4891,7 @@ class TestModelActivateRollback:
         monkeypatch.setattr(
             _mod,
             "_restart_existing_container",
-            lambda name, _state=None: events.append(f"restart:{name}") or name == "ods-litellm",
+            lambda name, _state=None, **_kwargs: events.append(f"restart:{name}") or name == "ods-litellm",
         )
         monkeypatch.setattr(
             _mod,
@@ -4624,6 +5040,8 @@ class TestModelActivateRollback:
             raise AssertionError("native Lemonade restart should be skipped")
 
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"litellm"})
+        monkeypatch.setattr(_mod, "resolve_compose_flags", list)
         monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
         monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
         monkeypatch.delenv("LITELLM_LEMONADE_API_KEY", raising=False)
@@ -4643,7 +5061,10 @@ class TestModelActivateRollback:
         assert handler.response_code == 200
         content = lemonade_yaml.read_text(encoding="utf-8")
         assert "model: openai/extra.new-model.gguf" in content
-        assert ["docker", "restart", "ods-litellm"] in calls
+        assert [
+            "docker", "compose", "up", "-d", "--no-deps",
+            "--force-recreate", "litellm",
+        ] in calls
 
     def test_windows_lemonade_runtime_ensure_persists_config_without_dependents(
         self, tmp_path, monkeypatch,
@@ -4835,6 +5256,8 @@ class TestModelActivateRollback:
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"hermes", "litellm"})
+        monkeypatch.setattr(_mod, "resolve_compose_flags", list)
         monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
         monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
         monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
@@ -4866,8 +5289,15 @@ class TestModelActivateRollback:
         content = local_yaml.read_text(encoding="utf-8")
         assert "model: openai/new-model.gguf" in content
         assert "api_base: http://host.docker.internal:9090/v1" in content
-        assert ["docker", "restart", "ods-litellm"] in calls
-        assert ["docker", "restart", "ods-hermes"] in calls
+        assert [
+            "docker", "compose", "up", "-d", "--no-deps",
+            "--force-recreate", "litellm",
+        ] in calls
+        assert [
+            "docker", "compose", "up", "-d", "--no-deps",
+            "--force-recreate", "hermes",
+        ] in calls
+        assert ["docker", "restart", "ods-hermes"] not in calls
 
     def test_windows_native_llama_applies_advanced_context_override(
         self, tmp_path, monkeypatch,
@@ -4960,11 +5390,16 @@ class TestModelActivateRollback:
                     stdout=_llama_identity_response("new-model.gguf"),
                     stderr="",
                 )
-            if cmd == ["docker", "restart", "ods-litellm"]:
+            if cmd == [
+                "docker", "compose", "up", "-d", "--no-deps",
+                "--force-recreate", "litellm",
+            ]:
                 raise subprocess.TimeoutExpired(cmd, 60)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"litellm"})
+        monkeypatch.setattr(_mod, "resolve_compose_flags", list)
         monkeypatch.setattr(_mod.platform, "system", lambda: "Windows")
         monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
         monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
@@ -5043,6 +5478,8 @@ class TestModelActivateRollback:
         hermes_template.write_text(hermes_text, encoding="utf-8")
 
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"hermes"})
+        monkeypatch.setattr(_mod, "resolve_compose_flags", lambda: [])
         monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
         monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
@@ -5072,7 +5509,11 @@ class TestModelActivateRollback:
         assert handler.response_code == 200
         assert '  default: "new-model.gguf"' in hermes_live.read_text(encoding="utf-8")
         assert '  default: "new-model.gguf"' in hermes_template.read_text(encoding="utf-8")
-        assert ["docker", "restart", "ods-hermes"] in calls
+        assert [
+            "docker", "compose", "up", "-d", "--no-deps",
+            "--force-recreate", "hermes",
+        ] in calls
+        assert ["docker", "restart", "ods-hermes"] not in calls
 
     def test_activation_uses_catalog_context_instead_of_current_env_floor(
         self, tmp_path, monkeypatch,
@@ -5252,6 +5693,8 @@ class TestModelActivateRollback:
 
         monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "CORE_SERVICE_IDS", {"hermes"})
+        monkeypatch.setattr(_mod, "resolve_compose_flags", lambda: [])
         monkeypatch.delenv("ODS_HOST_INSTALL_DIR", raising=False)
         monkeypatch.setattr(_mod.time, "sleep", lambda _seconds: None)
         monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
@@ -5280,7 +5723,11 @@ class TestModelActivateRollback:
         assert container_writes
         assert '  default: "new-model.gguf"' in container_config["text"]
         assert '  default: "new-model.gguf"' in hermes_template.read_text(encoding="utf-8")
-        assert ["docker", "restart", "ods-hermes"] in calls
+        assert [
+            "docker", "compose", "up", "-d", "--no-deps",
+            "--force-recreate", "hermes",
+        ] in calls
+        assert ["docker", "restart", "ods-hermes"] not in calls
 
     def test_capture_hermes_config_falls_back_when_stat_is_denied(
         self, tmp_path, monkeypatch,
@@ -5337,6 +5784,13 @@ class TestModelActivateRollback:
         install_dir, env_path, _env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
             _write_model_activation_fixture(tmp_path)
         )
+        env_path.write_text(
+            env_path.read_text(encoding="utf-8")
+            + "MODEL_RECOMMENDED_MODEL=new-model\n"
+            + "MODEL_RECOMMENDED_GGUF=new-model.gguf\n"
+            + "MODEL_RECOMMENDED_CONTEXT=131072\n",
+            encoding="utf-8",
+        )
         model_library = install_dir / "config" / "model-library.json"
         model_library.write_text(json.dumps({
             "models": [{
@@ -5389,6 +5843,8 @@ class TestModelActivateRollback:
 
         assert handler.response_code == 200
         env_text = env_path.read_text(encoding="utf-8")
+        # A hardware-specific runtime profile is the safety boundary. The
+        # generic installer recommendation must not silently replace it.
         assert "MAX_CONTEXT=65536" in env_text
         assert "MODEL_RUNTIME_PROFILE=nvidia-8gb-test" in env_text
         assert "LLAMA_SERVER_IMAGE=example.test/llama:turbo" in env_text
@@ -5429,6 +5885,7 @@ class TestModelActivateRollback:
                     "env": {
                         "LLAMA_ARG_CACHE_TYPE_K": "q4_0",
                         "LLAMA_ARG_CACHE_TYPE_V": "q4_0",
+                        "LLAMA_SERVER_MEMORY_LIMIT": "8G",
                     },
                 }],
             }]
@@ -5445,6 +5902,7 @@ class TestModelActivateRollback:
                 "env": {
                     "LLAMA_ARG_CACHE_TYPE_K": "q4_0",
                     "LLAMA_ARG_CACHE_TYPE_V": "q4_0",
+                    "LLAMA_SERVER_MEMORY_LIMIT": "8G",
                 },
             },
         )
@@ -5491,6 +5949,7 @@ class TestModelActivateRollback:
         assert env["MODEL_RUNTIME_PROFILE"] == "nvidia-8gb-64k"
         assert env["LLAMA_ARG_CACHE_TYPE_K"] == "q4_0"
         assert env["LLAMA_ARG_CACHE_TYPE_V"] == "q4_0"
+        assert env["LLAMA_SERVER_MEMORY_LIMIT"] == "8G"
         assert "n-ctx = 524288" in (
             install_dir / "config" / "llama-server" / "models.ini"
         ).read_text(encoding="utf-8")
@@ -5615,9 +6074,9 @@ class TestModelActivateRollback:
                 return kwargs["gguf_file"]
             return True
 
-        def restart_dependent(container, _state=None):
+        def restart_dependent(container, _state=None, **kwargs):
             nonlocal litellm_restarts
-            events.append(f"dependent:{container}")
+            events.append(f"dependent:{container}:{kwargs.get('recreate')}")
             if container == "ods-litellm":
                 litellm_restarts += 1
                 if litellm_restarts == 1:
@@ -5625,10 +6084,22 @@ class TestModelActivateRollback:
                 return True
             return False
 
+        def restore_dependent(container, _state, **kwargs):
+            events.append(f"restore:{container}:{kwargs.get('recreate')}")
+            return True
+
+        states = {
+            "ods-litellm": {"exists": True, "running": True},
+            "ods-hermes": {"exists": False, "running": False},
+            "ods-openclaw": {"exists": False, "running": False},
+            "ods-perplexica": {"exists": False, "running": False},
+        }
         monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(_mod, "_capture_container_state", lambda name: states[name])
         monkeypatch.setattr(_mod, "_compose_restart_llama_server", restart_runtime)
         monkeypatch.setattr(_mod, "_wait_for_model_readiness", readiness)
         monkeypatch.setattr(_mod, "_restart_existing_container", restart_dependent)
+        monkeypatch.setattr(_mod, "_restore_container_state", restore_dependent)
         handler = _ResponseHandler()
 
         _mod.AgentHandler._do_model_activate(handler, "target-model")
@@ -5638,8 +6109,9 @@ class TestModelActivateRollback:
         assert events == [
             "runtime:new-model.gguf",
             "ready:new-model.gguf",
-            "dependent:ods-litellm",
+            "dependent:ods-litellm:True",
             "runtime:old-model.gguf",
+            "restore:ods-litellm:True",
             "ready:old-model.gguf",
         ]
 
@@ -5672,7 +6144,7 @@ class TestModelActivateRollback:
         monkeypatch.setattr(_mod, "_compose_restart_llama_server", lambda _env: None)
         monkeypatch.setattr(_mod, "_wait_for_model_readiness", _mock_verified_readiness)
         monkeypatch.setattr(
-            _mod, "_restart_existing_container", lambda _container, _state=None: False
+            _mod, "_restart_existing_container", lambda _container, _state=None, **_kwargs: False
         )
         monkeypatch.setattr(
             _mod,
@@ -6294,7 +6766,7 @@ class TestModelActivateRollback:
         monkeypatch.setattr(
             _mod,
             "_restart_existing_container",
-            lambda name, _state=None: name == "ods-hermes",
+            lambda name, _state=None, **_kwargs: name == "ods-hermes",
         )
         monkeypatch.setattr(
             _mod,
@@ -6387,6 +6859,40 @@ class TestModelActivateRollback:
 
         assert handler.response_code == 400
         assert handler.parse_response()["code"] == "tier_model_mismatch"
+        assert env_path.read_text(encoding="utf-8") == env_text
+        assert restarts == []
+
+    def test_managed_pixel_rejects_unusable_context_before_mutation(
+        self, tmp_path, monkeypatch,
+    ):
+        install_dir, env_path, env_text, _models_ini, _ini_text, _yaml, _yaml_text = (
+            _write_model_activation_fixture(tmp_path)
+        )
+        env_text = env_text.replace("CTX_SIZE=2048", "CTX_SIZE=65536")
+        env_path.write_text(env_text, encoding="utf-8")
+        restarts = []
+        monkeypatch.setattr(_mod, "INSTALL_DIR", install_dir)
+        monkeypatch.setattr(
+            _mod,
+            "_ods_managed_pixel_identity",
+            lambda: ("pixel-owner", tmp_path / "pixel-owner"),
+        )
+        monkeypatch.setattr(
+            _mod, "_compose_restart_llama_server", lambda _env: restarts.append(True)
+        )
+        handler = _ResponseHandler()
+
+        _mod.AgentHandler._do_model_activate(
+            handler,
+            "target-model",
+            requested_context_length=8192,
+        )
+
+        assert handler.response_code == 400
+        response = handler.parse_response()
+        assert "at least 16384" in response["error"]
+        assert response["code"] == "pixel_context_too_small"
+        assert "rolled_back" not in response
         assert env_path.read_text(encoding="utf-8") == env_text
         assert restarts == []
 
@@ -6575,7 +7081,9 @@ class TestModelActivateRollback:
         monkeypatch.setattr(
             _mod,
             "_restart_existing_container",
-            lambda name, _state=None: events.append(f"restart:{name}") or name == "ods-litellm",
+            lambda name, _state=None, **kwargs: events.append(
+                f"restart:{name}:{kwargs.get('recreate')}"
+            ) or name == "ods-litellm",
         )
         monkeypatch.setattr(_mod, "_verify_litellm_route", lambda _env: events.append("litellm-ready"))
         monkeypatch.setattr(
@@ -6588,6 +7096,7 @@ class TestModelActivateRollback:
         _mod.AgentHandler._do_model_activate(handler, "target-model")
 
         assert handler.response_code == 200
+        assert "restart:ods-litellm:True" in events
         assert events.index("litellm-ready") < events.index("opencode-restart")
 
 
